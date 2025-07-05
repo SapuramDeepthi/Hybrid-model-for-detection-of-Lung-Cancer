@@ -1,0 +1,171 @@
+# Mount Google Drive to access files
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Step 1: Unzip lung CT dataset from Drive
+import zipfile
+import os
+
+zip_path = '/content/drive/MyDrive/Dataset/lungct.zip'  # Path to zip file
+extract_path = '/content/drive/MyDrive/Dataset/lungct'  # Destination folder
+
+os.makedirs(extract_path, exist_ok=True)
+with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+    zip_ref.extractall(extract_path)
+print("Extraction completed.")
+
+# Step 2: Load and preprocess lung CT images
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+def load_lung_images(dataset_path, size=(256, 256), max_images_per_class=1000):
+    classes = {"normal": 0, "adenocarcinoma": 1, "squamouscell": 2, "largecell": 3}
+    all_images, all_labels = [], []
+    for class_name, label in classes.items():
+        class_dir = os.path.join(dataset_path, class_name)
+        if not os.path.isdir(class_dir):
+            print(f"Warning: {class_dir} not found!")
+            continue
+        image_files = sorted(os.listdir(class_dir))[:max_images_per_class]
+        for image_file in tqdm(image_files, desc=f"Loading {class_name}"):
+            img = cv2.imread(os.path.join(class_dir, image_file), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                img = cv2.resize(img, size) / 255.0
+                all_images.append(img)
+                all_labels.append(label)
+    return np.array(all_images), np.array(all_labels)
+
+# Update the dataset path
+dataset_path = "/content/drive/MyDrive/Dataset/lungct/lungct"
+images, labels = load_lung_images(dataset_path)
+
+# Step 3: Median filtering and normalization
+def resize_images(images, size=(256, 256)):
+    return np.array([cv2.resize(img, size) / 255.0 for img in images])
+
+def apply_median_filter(images, ksize=3):
+    return np.array([cv2.medianBlur((img * 255).astype(np.uint8), ksize) / 255.0 for img in images])
+
+resized_images = resize_images(images)
+filtered_images = apply_median_filter(resized_images)
+
+# Step 4: Otsu thresholding and morphological operations
+def estimate_otsu_threshold(images, sample_size=100):
+    thresholds = []
+    for img in images[:sample_size]:
+        thresh_val, _ = cv2.threshold((img * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thresholds.append(thresh_val / 255.0)
+    return np.mean(thresholds)
+
+def apply_fixed_threshold(images, threshold):
+    return np.array([(img > threshold).astype(np.uint8) for img in images])
+
+def apply_morphological_opening(images, kernel_size=(3, 3)):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
+    return np.array([cv2.morphologyEx(img.astype(np.uint8), cv2.MORPH_OPEN, kernel) for img in images])
+
+avg_threshold = estimate_otsu_threshold(filtered_images)
+thresholded_images = apply_fixed_threshold(filtered_images, avg_threshold)
+refined_images = apply_morphological_opening(thresholded_images)
+
+# Step 5: Apply active contour segmentation
+from skimage.segmentation import active_contour
+from skimage.filters import gaussian
+
+def apply_active_contour(filtered_images, refined_masks, alpha=0.015, beta=10, gamma=0.001):
+    all_snakes = []
+    for idx in range(len(filtered_images)):
+        image = gaussian(filtered_images[idx], sigma=1)
+        h, w = image.shape
+        s = np.linspace(0, 2 * np.pi, 400)
+        r = (h // 2) + (min(h, w) // 4) * np.sin(s)
+        c = (w // 2) + (min(h, w) // 4) * np.cos(s)
+        init_snake = np.array([r, c]).T
+        snake = active_contour(image, init_snake, alpha=alpha, beta=beta, gamma=gamma)
+        all_snakes.append(snake)
+    return all_snakes
+
+all_snakes = apply_active_contour(filtered_images, refined_images)
+
+# Step 6: Extract features using Circular Hough Transform
+def extract_circle_features(filtered_images):
+    circle_features = []
+    for img in filtered_images:
+        blurred = cv2.GaussianBlur((img * 255).astype(np.uint8), (9, 9), 2)
+        circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, 1.2, 20, param1=50, param2=30, minRadius=5, maxRadius=60)
+        if circles is not None:
+            circles = np.uint16(np.around(circles[0]))
+            circle_features.append([len(circles), np.mean(circles[:, 2])])
+        else:
+            circle_features.append([0, 0])
+    return circle_features
+
+circle_features = extract_circle_features(filtered_images)
+
+# Step 7: CNN Classification
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+# Reshape and preprocess data for CNN
+X = np.array(images).reshape(-1, 128, 128, 1)
+y = to_categorical(np.array(labels), num_classes=4)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Build CNN model
+model = Sequential([
+    Conv2D(32, (3, 3), activation='relu', input_shape=(128, 128, 1)),
+    MaxPooling2D((2, 2)),
+    Conv2D(64, (3, 3), activation='relu'),
+    MaxPooling2D((2, 2)),
+    Conv2D(128, (3, 3), activation='relu'),
+    MaxPooling2D((2, 2)),
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(4, activation='softmax')
+])
+
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.fit(X_train, y_train, validation_split=0.2, epochs=30, batch_size=32)
+
+# Evaluate model
+y_pred = np.argmax(model.predict(X_test), axis=1)
+y_true = np.argmax(y_test, axis=1)
+print("Accuracy:", accuracy_score(y_true, y_pred))
+print("Precision:", precision_score(y_true, y_pred, average='weighted'))
+print("Recall:", recall_score(y_true, y_pred, average='weighted'))
+print("F1-score:", f1_score(y_true, y_pred, average='weighted'))
+
+# Save model
+model.save('/content/drive/MyDrive/lung_cancer_model.h5')
+print("Model saved to Google Drive")
+
+# Step 8: Transfer learning using VGG19 (HOVG-Net)
+from tensorflow.keras.applications import VGG19
+from tensorflow.keras.layers import Input, Concatenate
+from tensorflow.keras.models import Model
+
+input_tensor = Input(shape=(128, 128, 1))
+x = Concatenate()([input_tensor, input_tensor, input_tensor])
+vgg_base = VGG19(weights='imagenet', include_top=False, input_tensor=x)
+vgg_base.trainable = False
+
+hovg_model = Sequential([
+    vgg_base,
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(4, activation='softmax')
+])
+
+hovg_model.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=['accuracy'])
+hovg_model.fit(X_train, y_train, validation_split=0.2, epochs=10, batch_size=32)
+
+# Save HOVG-Net model
+hovg_model.save('/content/hovg_net_model.h5')
+print("HOVG-Net model saved.")
